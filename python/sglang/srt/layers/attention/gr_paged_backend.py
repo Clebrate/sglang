@@ -1,9 +1,7 @@
 """Eager GR attention over paged context and a group-owned beam arena.
 
-The _prefill_attention/_decode_attention methods are the operation boundary for
-a future kernel. Their defaults use the torch_*_attention functions below.
-Context plus selected ancestry is one softmax domain; scratch is bounded by a
-query block for prefill and one beam for decode.
+Hopper BF16 decode uses the CuTe paged operator; Context plus selected ancestry is one softmax
+domain;
 """
 
 from __future__ import annotations
@@ -13,6 +11,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.gr_paged_attention import (
+    gr_paged_decode_attention,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 
@@ -174,6 +175,16 @@ class GRPagedAttentionBackend(AttentionBackend):
             if meta is None or meta.page_size != self.page_size:
                 raise ValueError("gr_paged decode requires matching GR page metadata")
             self.forward_metadata = meta
+            self.context_lens = torch.tensor(
+                [meta.context_len],
+                dtype=torch.int32,
+                device=meta.context_pages.device,
+            )
+            self.history_lens = torch.tensor(
+                [meta.step + 1],
+                dtype=torch.int32,
+                device=meta.context_pages.device,
+            )
         elif batch.forward_mode.is_extend() and not batch.forward_mode.is_mixed():
             if len(batch.extend_seq_lens_cpu) != 1:
                 raise ValueError("gr_paged supports one admitted GR group per batch")
@@ -225,11 +236,27 @@ class GRPagedAttentionBackend(AttentionBackend):
     def forward_decode(self, q, k, v, layer, batch, save_kv_cache=True, **kwargs):
         self._write_kv(k, v, layer, batch, save_kv_cache)
         key_pool, value_pool = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        query = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        query = q.reshape(
+            1,
+            self.forward_metadata.beam_width,
+            layer.tp_q_head_num,
+            layer.head_dim,
+        )
         output = self._decode_attention(
             query, key_pool, value_pool, self.forward_metadata, layer.scaling
         )
         return output.reshape(q.shape[0], -1)
 
     def _decode_attention(self, q, key_pool, value_pool, meta, scale):
-        return torch_decode_attention(q, key_pool, value_pool, meta, scale)
+        return gr_paged_decode_attention(
+            q=q,
+            key_pool=key_pool,
+            value_pool=value_pool,
+            context_pages=meta.context_pages.unsqueeze(0),
+            beam_pages=meta.beam_pages.unsqueeze(0),
+            ancestor_columns=meta.topk_indices.unsqueeze(0),
+            context_lens=self.context_lens,
+            history_lens=self.history_lens,
+            page_size=meta.page_size,
+            scale=scale,
+        )

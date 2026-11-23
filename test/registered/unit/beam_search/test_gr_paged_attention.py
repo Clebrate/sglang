@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.kernels.ops.attention.gr_paged_attention import gr_paged_decode_attention
 from sglang.srt.beam_search.paged_kv import GRPagedForwardMetadata
 from sglang.srt.layers.attention.gr_paged_backend import (
     GRPagedAttentionBackend,
@@ -14,9 +15,11 @@ from sglang.srt.layers.attention.gr_paged_backend import (
     torch_prefill_attention,
     validate_gr_paged_configuration,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 
 
 def dense_attention(q, k, v, scale, offset=None):
@@ -36,22 +39,25 @@ def dense_attention(q, k, v, scale, offset=None):
 def layout(context_k, context_v, beam_k, beam_v, page_size, ancestry):
     """Scatter known logical KV onto nonadjacent pages; poison padding."""
     context_len, kv_heads, dim = context_k.shape
+    device = context_k.device
     steps, width = beam_k.shape[:2]
     context_page_count = (context_len + page_size - 1) // page_size
     step_page_count = (width + page_size - 1) // page_size
-    page_ids = torch.arange(1, 2 * (context_page_count + steps * step_page_count), 2)
+    page_ids = torch.arange(
+        1, 2 * (context_page_count + steps * step_page_count), 2, device=device
+    )
     context_pages = page_ids[:context_page_count]
     beam_pages = page_ids[context_page_count:].reshape(steps, step_page_count)
     pool_shape = (int(page_ids[-1] + 1) * page_size, kv_heads, dim)
-    key_pool = torch.full(pool_shape, torch.nan, dtype=context_k.dtype)
+    key_pool = torch.full(pool_shape, torch.nan, dtype=context_k.dtype, device=device)
     value_pool = torch.full_like(key_pool, torch.nan)
-    positions = torch.arange(context_len)
+    positions = torch.arange(context_len, device=device)
     context_locs = (
         context_pages[positions // page_size] * page_size + positions % page_size
     )
     key_pool[context_locs] = context_k
     value_pool[context_locs] = context_v
-    columns = torch.arange(width)
+    columns = torch.arange(width, device=device)
     for step in range(steps):
         slots = beam_pages[step, columns // page_size] * page_size + columns % page_size
         key_pool[slots] = beam_k[step]
@@ -68,6 +74,27 @@ def layout(context_k, context_v, beam_k, beam_v, page_size, ancestry):
         out_cache_loc=slots,
     )
     return key_pool, value_pool, metadata
+
+
+def cute_decode_attention(q, key_pool, value_pool, metadata, scale):
+    """Adapt the existing single-group cases to the batched CUDA interface."""
+    device = q.device
+    return gr_paged_decode_attention(
+        q=q.unsqueeze(0),
+        key_pool=key_pool,
+        value_pool=value_pool,
+        context_pages=metadata.context_pages.to(device).unsqueeze(0),
+        beam_pages=metadata.beam_pages.to(device).unsqueeze(0),
+        ancestor_columns=metadata.topk_indices.to(device).unsqueeze(0),
+        context_lens=torch.tensor(
+            [metadata.context_len], dtype=torch.int32, device=device
+        ),
+        history_lens=torch.tensor(
+            [metadata.step + 1], dtype=torch.int32, device=device
+        ),
+        page_size=metadata.page_size,
+        scale=scale,
+    ).squeeze(0)
 
 
 class TestGRPagedAttention(unittest.TestCase):
@@ -152,7 +179,7 @@ class TestGRPagedAttention(unittest.TestCase):
         actual = _torch_attention(q, k, v, 8**-0.5, query_offset=5)
         torch.testing.assert_close(actual, expected, atol=3e-7, rtol=3e-6)
 
-    def test_prefill_and_decode_consume_previously_written_kv(self):
+    def test_prefill_consumes_previously_written_kv(self):
         context_k = torch.zeros(3, 1, 2)
         context_v = torch.tensor([2.0, 4.0, 6.0])[:, None, None].expand_as(context_k)
         beam_k = torch.zeros(1, 2, 1, 2)
@@ -174,26 +201,18 @@ class TestGRPagedAttention(unittest.TestCase):
             logit_cap=0,
             sliding_window_size=-1,
         )
-        for decode in (False, True):
-            backend.forward_metadata = (
-                meta
-                if decode
-                else SimpleNamespace(
-                    context_pages=meta.context_pages, context_len=3, prefix_len=0
+        backend.forward_metadata = SimpleNamespace(
+            context_pages=meta.context_pages, context_len=3, prefix_len=0
+        )
+        expected = torch.tensor([2.0, 3.0, 4.0])
+        q = torch.zeros(len(expected), 8)
+        # Absent or stale input K/V must not replace a fused writer's data.
+        for kv in (None, torch.full((len(expected), 1, 2), torch.nan)):
+            with self.subTest(missing_kv=kv is None):
+                actual = backend.forward_extend(
+                    q, kv, kv, layer, SimpleNamespace(), save_kv_cache=False
                 )
-            )
-            expected = torch.tensor([5.0, 5.5] if decode else [2.0, 3.0, 4.0])
-            q = torch.zeros(len(expected), 8)
-            # Absent or stale input K/V must not replace a fused writer's data.
-            for kv in (None, torch.full((len(expected), 1, 2), torch.nan)):
-                with self.subTest(decode=decode, missing_kv=kv is None):
-                    forward = (
-                        backend.forward_decode if decode else backend.forward_extend
-                    )
-                    actual = forward(
-                        q, kv, kv, layer, SimpleNamespace(), save_kv_cache=False
-                    )
-                    torch.testing.assert_close(actual, expected[:, None].expand_as(q))
+                torch.testing.assert_close(actual, expected[:, None].expand_as(q))
         backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
 
     def test_configuration_scope(self):
@@ -225,6 +244,188 @@ class TestGRPagedAttention(unittest.TestCase):
         ).items():
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_gr_paged_configuration({**base, key: value})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CuTe decode requires CUDA")
+class TestCuTeGRPagedAttention(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(17)
+
+    def test_shared_parent_without_sibling_or_padding_visibility(self):
+        for dim in (64, 128):
+            with self.subTest(dim=dim):
+                context = torch.zeros(3, 1, dim, dtype=torch.bfloat16)
+                beam_k = torch.zeros(2, 2, 1, dim, dtype=torch.bfloat16)
+                beam_v = torch.tensor(
+                    [[2.0, 1000.0], [4.0, 8.0]], dtype=torch.bfloat16
+                )[:, :, None, None].expand_as(beam_k)
+                ancestry = torch.tensor([[0, 0], [0, 1]])
+                key, value, meta = layout(context, context, beam_k, beam_v, 4, ancestry)
+                q = torch.zeros(2, 4, dim, device="cuda", dtype=torch.bfloat16)
+                actual = cute_decode_attention(q, key.cuda(), value.cuda(), meta, 1.0)
+                expected = torch.tensor([1.2, 2.0], dtype=q.dtype)[:, None, None]
+                self.assertTrue(torch.isfinite(actual).all().item())
+                torch.testing.assert_close(
+                    actual.cpu(), expected.expand(2, 4, dim), atol=0.002, rtol=0.008
+                )
+
+    def test_pages_and_tp_match_dense_oracle(self):
+        for dim in (64, 128):
+            for width in (2, 5, 17):
+                context_k = torch.randn(35, 4, dim).bfloat16()
+                context_v = torch.randn_like(context_k)
+                beam_k = torch.randn(3, width, 4, dim).bfloat16()
+                beam_v = torch.randn_like(beam_k)
+                q = torch.randn(width, 16, dim).bfloat16()
+                ancestry = torch.stack(
+                    (
+                        torch.arange(width) % 2,
+                        torch.zeros(width, dtype=torch.long),
+                        torch.arange(width),
+                    ),
+                    dim=1,
+                )
+                expected = torch.empty_like(q)
+                for beam in range(width):
+                    k = torch.cat((context_k, beam_k[torch.arange(3), ancestry[beam]]))
+                    v = torch.cat((context_v, beam_v[torch.arange(3), ancestry[beam]]))
+                    expected[beam : beam + 1] = dense_attention(
+                        q[beam : beam + 1], k, v, dim**-0.5
+                    )
+                q_cuda = q.cuda()
+                for page_size in (1, 4, 16, 32):
+                    key, value, meta = layout(
+                        context_k, context_v, beam_k, beam_v, page_size, ancestry
+                    )
+                    # Transfer before splitting heads so TP retains pool strides.
+                    key_cuda, value_cuda = key.cuda(), value.cuda()
+                    for tp in (1, 2, 4):
+                        with self.subTest(
+                            dim=dim, width=width, page_size=page_size, tp=tp
+                        ):
+                            outputs = []
+                            for qpart, kpart, vpart in zip(
+                                q_cuda.chunk(tp, 1),
+                                key_cuda.chunk(tp, 1),
+                                value_cuda.chunk(tp, 1),
+                            ):
+                                if tp > 1:
+                                    self.assertFalse(qpart.is_contiguous())
+                                    self.assertFalse(kpart.is_contiguous())
+                                outputs.append(
+                                    cute_decode_attention(
+                                        qpart, kpart, vpart, meta, dim**-0.5
+                                    )
+                                )
+                            actual = torch.cat(outputs, dim=1)
+                            self.assertTrue(torch.isfinite(actual).all().item())
+                            torch.testing.assert_close(
+                                actual.cpu(), expected, atol=0.002, rtol=0.008
+                            )
+
+    def test_ragged_batch_and_partial_cta(self):
+        context_lens, history_lens = (1, 17, 35), (1, 2, 3)
+        batch, width, heads, kv_heads, dim, page_size = 3, 5, 2, 1, 64, 16
+        q = torch.randn(batch, width, heads, dim).bfloat16()
+        expected = torch.empty_like(q)
+        context_pages = torch.zeros(batch, 3, dtype=torch.int64)
+        beam_pages = torch.zeros(batch, 3, 1, dtype=torch.int64)
+        ancestors = torch.zeros(batch, width, 3, dtype=torch.int64)
+        keys, values, page_offset = [], [], 0
+        for b, (context_len, steps) in enumerate(zip(context_lens, history_lens)):
+            context_k = torch.randn(context_len, kv_heads, dim).bfloat16()
+            context_v = torch.randn_like(context_k)
+            beam_k = torch.randn(steps, width, kv_heads, dim).bfloat16()
+            beam_v = torch.randn_like(beam_k)
+            step = torch.arange(steps)
+            ancestry = torch.arange(width)[:, None] // (2 ** (steps - 1 - step))
+            key, value, meta = layout(
+                context_k, context_v, beam_k, beam_v, page_size, ancestry
+            )
+            context_pages[b, : len(meta.context_pages)] = (
+                meta.context_pages + page_offset
+            )
+            beam_pages[b, :steps] = meta.beam_pages + page_offset
+            ancestors[b, :, :steps] = ancestry
+            keys.append(key)
+            values.append(value)
+            page_offset += key.shape[0] // page_size
+            for beam in range(width):
+                k = torch.cat((context_k, beam_k[step, ancestry[beam]]))
+                v = torch.cat((context_v, beam_v[step, ancestry[beam]]))
+                expected[b, beam : beam + 1] = dense_attention(
+                    q[b, beam : beam + 1], k, v, dim**-0.5
+                )
+        # 3 * 5 * 2 = 30 warps: the last CTA has two inactive warps.
+        actual = gr_paged_decode_attention(
+            q.cuda(),
+            torch.cat(keys).cuda(),
+            torch.cat(values).cuda(),
+            context_pages.cuda(),
+            beam_pages.cuda(),
+            ancestors.cuda(),
+            context_lens=torch.tensor(context_lens, dtype=torch.int32, device="cuda"),
+            history_lens=torch.tensor(history_lens, dtype=torch.int32, device="cuda"),
+            page_size=page_size,
+            scale=dim**-0.5,
+        )
+        self.assertEqual(actual.shape, q.shape)
+        self.assertTrue(torch.isfinite(actual).all().item())
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.002, rtol=0.008)
+
+    def test_decode_consumes_previously_written_kv(self):
+        for dim in (64, 128):
+            with self.subTest(dim=dim):
+                context_k = torch.zeros(3, 1, dim, device="cuda", dtype=torch.bfloat16)
+                context_v = torch.tensor(
+                    [2.0, 4.0, 6.0], device="cuda", dtype=torch.bfloat16
+                )[:, None, None].expand_as(context_k)
+                beam_k = torch.zeros(1, 2, 1, dim, device="cuda", dtype=torch.bfloat16)
+                beam_v = torch.tensor([8.0, 10.0], device="cuda", dtype=torch.bfloat16)[
+                    None, :, None, None
+                ].expand_as(beam_k)
+                key, value, meta = layout(
+                    context_k,
+                    context_v,
+                    beam_k,
+                    beam_v,
+                    16,
+                    torch.tensor([[0], [1]], device="cuda"),
+                )
+                backend = GRPagedAttentionBackend.__new__(GRPagedAttentionBackend)
+                backend.page_size = 16
+                backend.token_to_kv_pool = SimpleNamespace(
+                    get_kv_buffer=Mock(return_value=(key, value)), set_kv_buffer=Mock()
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE, gr_paged_metadata=meta
+                )
+                backend.init_forward_metadata(batch)
+                layer = SimpleNamespace(
+                    layer_id=0,
+                    tp_q_head_num=4,
+                    head_dim=dim,
+                    scaling=1.0,
+                    is_cross_attention=False,
+                    logit_cap=0,
+                    sliding_window_size=-1,
+                )
+                q = torch.zeros(2, 12 * dim, device="cuda", dtype=torch.bfloat16)[
+                    :, : 4 * dim
+                ]
+                expected = torch.tensor([5.0, 5.5], dtype=q.dtype)[:, None].expand(
+                    q.shape
+                )
+                for kv in (None, torch.full_like(beam_k[0], torch.nan)):
+                    with self.subTest(missing_kv=kv is None):
+                        actual = backend.forward_decode(
+                            q, kv, kv, layer, batch, save_kv_cache=False
+                        )
+                        self.assertTrue(torch.isfinite(actual).all().item())
+                        torch.testing.assert_close(
+                            actual.cpu(), expected, atol=0.002, rtol=0.008
+                        )
+                backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
 
 
 if __name__ == "__main__":
