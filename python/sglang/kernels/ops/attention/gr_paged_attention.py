@@ -26,8 +26,21 @@ def gr_paged_decode_attention(
 ):
     batch, width, q_heads, dim = q.shape
     kv_heads = key_pool.shape[1]
+    # Target 256 CTAs on Hopper; limit splits using the context capacity.
+    num_ctas = batch * q_heads * ((width + 63) // 64)
+    context_capacity = context_pages.shape[1] * page_size
+    num_splits = min(16, max(1, 256 // num_ctas), max(1, context_capacity // 256))
 
     out = torch.empty_like(q)
+    partials = (
+        out
+        if num_splits == 1
+        else torch.empty(
+            (batch, width, q_heads, num_splits, dim + 2),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    )
 
     tensors = (
         q,
@@ -38,6 +51,7 @@ def gr_paged_decode_attention(
         ancestor_columns,
         context_lens,
         history_lens,
+        partials,
         out,
     )
     cache_key = (
@@ -62,6 +76,7 @@ def gr_paged_decode_attention(
                 dim,
                 q_heads // kv_heads,
                 page_size,
+                num_splits,
             )
 
             compiled = cute.compile(
@@ -79,10 +94,11 @@ def gr_paged_decode_attention(
 
 
 class _GRPagedDecode:
-    def __init__(self, head_dim, q_heads_per_kv_head, page_size):
+    def __init__(self, head_dim, q_heads_per_kv_head, page_size, num_splits):
         self.head_dim = head_dim
         self.q_heads_per_kv_head = q_heads_per_kv_head
         self.page_size = page_size
+        self.num_splits = num_splits
         self.tile_m = 64
         self.tile_n = 64
         self.num_threads = 128
@@ -98,11 +114,11 @@ class _GRPagedDecode:
         ancestor_columns: cute.Tensor,
         context_lens: cute.Tensor,
         history_lens: cute.Tensor,
+        partials: cute.Tensor,
         out: cute.Tensor,
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
-
         smem_atom = warpgroup.make_smem_layout_atom(
             warpgroup.SmemLayoutAtomKind.K_SW128,
             cutlass.BFloat16,
@@ -169,6 +185,7 @@ class _GRPagedDecode:
             ancestor_columns,
             context_lens,
             history_lens,
+            partials,
             out,
             scale,
             sQ_layout,
@@ -181,11 +198,18 @@ class _GRPagedDecode:
             grid=(
                 cute.ceil_div(q.shape[1], self.tile_m),
                 q.shape[2],
-                q.shape[0],
+                q.shape[0] * self.num_splits,
             ),
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
+
+        if cutlass.const_expr(self.num_splits > 1):
+            self.combine(partials, out).launch(
+                grid=(cute.ceil_div(q.shape[1], 4), q.shape[2], q.shape[0]),
+                block=(128, 1, 1),
+                stream=stream,
+            )
 
     @cute.kernel
     def kernel(
@@ -198,6 +222,7 @@ class _GRPagedDecode:
         ancestor_columns: cute.Tensor,
         context_lens: cute.Tensor,
         history_lens: cute.Tensor,
+        partials: cute.Tensor,
         out: cute.Tensor,
         scale: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -242,7 +267,9 @@ class _GRPagedDecode:
             cute.select(sV.layout, mode=[1, 0]),
         )
 
-        beam_tile, head, batch = cute.arch.block_idx()
+        beam_tile, head, batch_split = cute.arch.block_idx()
+        batch = batch_split // self.num_splits
+        split = batch_split % self.num_splits
         thread_idx, _, _ = cute.arch.thread_idx()
 
         beam_begin = beam_tile * self.tile_m
@@ -250,6 +277,9 @@ class _GRPagedDecode:
 
         context_len = context_lens[batch]
         history_len = history_lens[batch]
+        # Only one partition includes the beam history in the joint softmax.
+        if split != 0:
+            history_len = history_len * 0
 
         for i in cutlass.range_constexpr(
             self.tile_m * self.head_dim // self.num_threads
@@ -301,7 +331,10 @@ class _GRPagedDecode:
         tiled_mma_qk.set(warpgroup.Field.ACCUMULATE, True)
         tiled_mma_pv.set(warpgroup.Field.ACCUMULATE, True)
 
-        for context_tile in cutlass.range(cute.ceil_div(context_len, self.tile_n)):
+        num_context_tiles = cute.ceil_div(context_len, self.tile_n)
+        first_tile = num_context_tiles * split // self.num_splits
+        last_tile = num_context_tiles * (split + 1) // self.num_splits
+        for context_tile in cutlass.range(first_tile, last_tile):
             context_begin = context_tile * self.tile_n
             for i in cutlass.range_constexpr(
                 self.tile_n * self.head_dim // self.num_threads
@@ -429,9 +462,51 @@ class _GRPagedDecode:
         for r in cutlass.range_constexpr(num_rows):
             beam = beam_begin + output_coordinates_mn[r, 0][0]
             if beam < q.shape[1]:
-                inv_sum = cutlass.Float32(1.0) / row_sum[r]
-                for c in cutlass.range_constexpr(num_output_columns):
-                    dim = output_coordinates_mn[r, c][1]
+                if cutlass.const_expr(self.num_splits == 1):
+                    inv_sum = cutlass.Float32(1.0) / row_sum[r]
+                    for c in cutlass.range_constexpr(num_output_columns):
+                        dim = output_coordinates_mn[r, c][1]
+                        out[batch, beam, head, dim] = cutlass.BFloat16(
+                            accum_mn[r, c] * inv_sum
+                        )
+                else:
+                    if quad_lane == 0:
+                        partials[batch, beam, head, split, 0] = row_max[r]
+                        partials[batch, beam, head, split, 1] = row_sum[r]
+                    for c in cutlass.range_constexpr(num_output_columns):
+                        dim = output_coordinates_mn[r, c][1]
+                        partials[batch, beam, head, split, dim + 2] = accum_mn[r, c]
+
+    @cute.kernel
+    def combine(self, partials: cute.Tensor, out: cute.Tensor):
+        # Merge unnormalized (max, sum, weighted V) states from the partitions.
+        beam_tile, head, batch = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        beam = beam_tile * 4 + thread // 32
+        lane = thread % 32
+        if beam < out.shape[1]:
+            row_max = -cutlass.Float32.inf
+            for split in cutlass.range_constexpr(self.num_splits):
+                row_max = cute.arch.fmax(row_max, partials[batch, beam, head, split, 0])
+            safe_max = row_max
+            if row_max == -cutlass.Float32.inf:
+                safe_max = cutlass.Float32(0.0)
+            weights = cute.make_rmem_tensor((self.num_splits,), cutlass.Float32)
+            denominator = cutlass.Float32(0.0)
+            for split in cutlass.range_constexpr(self.num_splits):
+                weight = cute.math.exp2(
+                    (partials[batch, beam, head, split, 0] - safe_max) * _LOG2_E
+                )
+                weights[split] = weight
+                denominator += weight * partials[batch, beam, head, split, 1]
+            for i in cutlass.range_constexpr(cute.ceil_div(self.head_dim, 32)):
+                dim = lane + i * 32
+                if dim < self.head_dim:
+                    numerator = cutlass.Float32(0.0)
+                    for split in cutlass.range_constexpr(self.num_splits):
+                        numerator += (
+                            weights[split] * partials[batch, beam, head, split, dim + 2]
+                        )
                     out[batch, beam, head, dim] = cutlass.BFloat16(
-                        accum_mn[r, c] * inv_sum
+                        numerator / denominator
                     )
