@@ -108,7 +108,10 @@ class _GRPagedDecode:
         self.q_heads_per_kv_head = q_heads_per_kv_head
         self.page_size = page_size
         self.num_splits = num_splits
+        self.combine_group_bits = (num_splits - 1).bit_length()
+        self.combine_group_size = 1 << self.combine_group_bits
         self.async_kv = async_kv
+        self.num_stages = 2 if async_kv else 1
         self.tile_m = 64
         self.tile_n = 64
         self.num_threads = 128
@@ -142,14 +145,14 @@ class _GRPagedDecode:
 
         sK_layout = cute.tile_to_shape(
             smem_atom,
-            (self.tile_n, self.head_dim),
-            order=(0, 1),
+            (self.tile_n, self.head_dim, self.num_stages),
+            order=(0, 1, 2),
         )
 
         sV_layout = cute.tile_to_shape(
             smem_atom,
-            (self.tile_n, self.head_dim),
-            order=(0, 1),
+            (self.tile_n, self.head_dim, self.num_stages),
+            order=(0, 1, 2),
         )
 
         mma_qk_op = warpgroup.MmaF16BF16Op(
@@ -259,7 +262,7 @@ class _GRPagedDecode:
 
         sVt = cute.make_tensor(
             sV.iterator,
-            cute.select(sV.layout, mode=[1, 0]),
+            cute.select(sV.layout, mode=[1, 0, 2]),
         )
 
         beam_tile, head, batch_split = cute.arch.block_idx()
@@ -272,9 +275,6 @@ class _GRPagedDecode:
 
         context_len = context_lens[batch]
         history_len = history_lens[batch]
-        # Only one partition includes the beam history in the joint softmax.
-        if split != 0:
-            history_len = history_len * 0
 
         for i in cutlass.range_constexpr(
             self.tile_m * self.head_dim // self.num_threads
@@ -328,77 +328,43 @@ class _GRPagedDecode:
         tiled_mma_qk.set(warpgroup.Field.ACCUMULATE, True)
         tiled_mma_pv.set(warpgroup.Field.ACCUMULATE, True)
 
-        if cutlass.const_expr(self.async_kv):
-            copy_atom = cute.make_copy_atom(
-                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-                cutlass.BFloat16,
-                num_bits_per_copy=128,
-            )
-            # Eight threads cover D=64; each thread copies eight BF16 values.
-            tiled_copy = cute.make_tiled_copy_tv(
-                copy_atom,
-                cute.make_layout((16, 8), stride=(8, 1)),
-                cute.make_layout((1, 8)),
-            )
-            thread_copy = tiled_copy.get_slice(thread_idx)
-            copy_coordinates = thread_copy.partition_S(
-                cute.make_identity_tensor((self.tile_n, self.head_dim))
-            )
-            copy_k = thread_copy.partition_D(sK)
-            copy_v = thread_copy.partition_D(sV)
-
         num_context_tiles = cute.ceil_div(context_len, self.tile_n)
         first_tile = num_context_tiles * split // self.num_splits
         last_tile = num_context_tiles * (split + 1) // self.num_splits
+        if cutlass.const_expr(self.async_kv):
+            if first_tile < last_tile:
+                self.load_context_tile(
+                    key_pool,
+                    value_pool,
+                    context_pages,
+                    sK[None, None, 0],
+                    sV[None, None, 0],
+                    batch,
+                    kv_head,
+                    first_tile * self.tile_n,
+                    context_len,
+                )
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_threads()
+
         for context_tile in cutlass.range(first_tile, last_tile):
             context_begin = context_tile * self.tile_n
+            read_stage = (context_tile - first_tile) % self.num_stages
             if cutlass.const_expr(self.async_kv):
-                for row in cutlass.range_constexpr(cute.size(copy_k, mode=[1])):
-                    local_token = copy_coordinates[0, row, 0][0]
-                    token = context_begin + local_token
-                    slot = cutlass.Int64(0)
-                    if token < context_len:
-                        page = cutlass.Int64(
-                            context_pages[batch, token // self.page_size]
-                        )
-                        slot = page * cutlass.Int64(self.page_size) + cutlass.Int64(
-                            token % self.page_size
-                        )
-                    for col in cutlass.range_constexpr(cute.size(copy_k, mode=[2])):
-                        dim = copy_coordinates[0, row, col][1]
-                        if token < context_len:
-                            # partition_D retains the shared pointer's SW128 mapping.
-                            src_k = cute.make_tensor(
-                                cute.make_ptr(
-                                    cutlass.BFloat16,
-                                    cute.domain_offset(
-                                        (slot, kv_head, dim), key_pool
-                                    ).iterator.toint(),
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=16,
-                                ),
-                                copy_k[None, row, col].layout,
-                            )
-                            src_v = cute.make_tensor(
-                                cute.make_ptr(
-                                    cutlass.BFloat16,
-                                    cute.domain_offset(
-                                        (slot, kv_head, dim), value_pool
-                                    ).iterator.toint(),
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=16,
-                                ),
-                                copy_v[None, row, col].layout,
-                            )
-                            cute.copy(tiled_copy, src_k, copy_k[None, row, col])
-                            cute.copy(tiled_copy, src_v, copy_v[None, row, col])
-                        else:
-                            # Zero both operands: zero probabilities cannot mask NaN V.
-                            for elem in cutlass.range_constexpr(8):
-                                sK[local_token, dim + elem] = cutlass.BFloat16(0.0)
-                                sV[local_token, dim + elem] = cutlass.BFloat16(0.0)
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
+                next_tile = context_tile + 1
+                if next_tile < last_tile:
+                    self.load_context_tile(
+                        key_pool,
+                        value_pool,
+                        context_pages,
+                        sK[None, None, 1 - read_stage],
+                        sV[None, None, 1 - read_stage],
+                        batch,
+                        kv_head,
+                        next_tile * self.tile_n,
+                        context_len,
+                    )
             else:
                 for i in cutlass.range_constexpr(
                     self.tile_n * self.head_dim // self.num_threads
@@ -418,10 +384,10 @@ class _GRPagedDecode:
                         )
                         key_value = key_pool[slot, kv_head, dim]
                         value_value = value_pool[slot, kv_head, dim]
-                    sK[local_token, dim] = key_value
-                    sV[local_token, dim] = value_value
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_threads()
+                    sK[local_token, dim, 0] = key_value
+                    sV[local_token, dim, 0] = value_value
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_threads()
 
             scores.fill(0.0)
             warpgroup.fence()
@@ -430,7 +396,7 @@ class _GRPagedDecode:
                     tiled_mma_qk,
                     scores,
                     fragment_q[None, None, k],
-                    fragment_k[None, None, k],
+                    fragment_k[None, None, k, read_stage],
                     scores,
                 )
             warpgroup.commit_group()
@@ -478,17 +444,20 @@ class _GRPagedDecode:
                     tiled_mma_pv,
                     accum,
                     fragment_p[None, None, k],
-                    fragment_v[None, None, k],
+                    fragment_v[None, None, k, read_stage],
                     accum,
                 )
             warpgroup.commit_group()
             warpgroup.wait_group(0)
-            # All shared-memory consumers finish before the next tile overwrites it.
+            # Finish the current stage's reads and publish the prefetched stage.
+            if cutlass.const_expr(self.async_kv):
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.fence_view_async_shared()
             cute.arch.sync_threads()
 
-        # Four threads share a beam row. Its short, private history stays SIMT.
+        # Distribute private history across splits; four threads share a beam row.
         quad_lane = thread_idx % 4
-        for history_step in cutlass.range(history_len):
+        for history_step in cutlass.range(split, history_len, self.num_splits):
             for r in cutlass.range_constexpr(num_rows):
                 local_beam = output_coordinates_mn[r, 0][0]
                 beam = beam_begin + local_beam
@@ -542,6 +511,82 @@ class _GRPagedDecode:
                         dim = output_coordinates_mn[r, c][1]
                         partials[batch, beam, head, split, dim + 2] = accum_mn[r, c]
 
+    @cute.jit
+    def load_context_tile(
+        self,
+        key_pool: cute.Tensor,
+        value_pool: cute.Tensor,
+        context_pages: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        batch: cutlass.Int32,
+        kv_head: cutlass.Int32,
+        context_begin: cutlass.Int32,
+        context_len: cutlass.Int32,
+    ):
+        thread_idx, _, _ = cute.arch.thread_idx()
+        copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cutlass.BFloat16,
+            num_bits_per_copy=128,
+        )
+        # Eight threads cover D=64; each thread copies eight BF16 values.
+        tiled_copy = cute.make_tiled_copy_tv(
+            copy_atom,
+            cute.make_layout((16, 8), stride=(8, 1)),
+            cute.make_layout((1, 8)),
+        )
+        thread_copy = tiled_copy.get_slice(thread_idx)
+        copy_coordinates = thread_copy.partition_S(
+            cute.make_identity_tensor((self.tile_n, self.head_dim))
+        )
+        copy_k = thread_copy.partition_D(sK)
+        copy_v = thread_copy.partition_D(sV)
+
+        for row in cutlass.range_constexpr(cute.size(copy_k, mode=[1])):
+            local_token = copy_coordinates[0, row, 0][0]
+            token = context_begin + local_token
+            slot = cutlass.Int64(0)
+            if token < context_len:
+                page = cutlass.Int64(context_pages[batch, token // self.page_size])
+                slot = page * cutlass.Int64(self.page_size) + cutlass.Int64(
+                    token % self.page_size
+                )
+            for col in cutlass.range_constexpr(cute.size(copy_k, mode=[2])):
+                dim = copy_coordinates[0, row, col][1]
+                if token < context_len:
+                    # partition_D retains the shared pointer's SW128 mapping.
+                    src_k = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            cute.domain_offset(
+                                (slot, kv_head, dim), key_pool
+                            ).iterator.toint(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        copy_k[None, row, col].layout,
+                    )
+                    src_v = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            cute.domain_offset(
+                                (slot, kv_head, dim), value_pool
+                            ).iterator.toint(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        copy_v[None, row, col].layout,
+                    )
+                    cute.copy(tiled_copy, src_k, copy_k[None, row, col])
+                    cute.copy(tiled_copy, src_v, copy_v[None, row, col])
+                else:
+                    # Zero both operands: zero probabilities cannot mask NaN V.
+                    for elem in cutlass.range_constexpr(8):
+                        sK[local_token, dim + elem] = cutlass.BFloat16(0.0)
+                        sV[local_token, dim + elem] = cutlass.BFloat16(0.0)
+        cute.arch.cp_async_commit_group()
+
     @cute.kernel
     def combine(self, partials: cute.Tensor, out: cute.Tensor):
         # Merge unnormalized (max, sum, weighted V) states from the partitions.
@@ -549,29 +594,46 @@ class _GRPagedDecode:
         thread, _, _ = cute.arch.thread_idx()
         beam = beam_tile * 4 + thread // 32
         lane = thread % 32
+        lane_split = lane % self.combine_group_size
         if beam < out.shape[1]:
-            row_max = -cutlass.Float32.inf
-            for split in cutlass.range_constexpr(self.num_splits):
-                row_max = cute.arch.fmax(row_max, partials[batch, beam, head, split, 0])
+            # Each lane group cooperates on the split normalization state.
+            split_max = -cutlass.Float32.inf
+            split_sum = cutlass.Float32(0.0)
+            if lane_split < self.num_splits:
+                split_max = partials[batch, beam, head, lane_split, 0]
+                split_sum = partials[batch, beam, head, lane_split, 1]
+            row_max = split_max
+            for i in cutlass.range_constexpr(self.combine_group_bits):
+                row_max = cute.arch.fmax(
+                    row_max, cute.arch.shuffle_sync_bfly(row_max, offset=1 << i)
+                )
             safe_max = row_max
             if row_max == -cutlass.Float32.inf:
                 safe_max = cutlass.Float32(0.0)
-            weights = cute.make_rmem_tensor((self.num_splits,), cutlass.Float32)
-            denominator = cutlass.Float32(0.0)
+            weight = cute.math.exp2((split_max - safe_max) * _LOG2_E)
+            denominator = weight * split_sum
+            for i in cutlass.range_constexpr(self.combine_group_bits):
+                denominator += cute.arch.shuffle_sync_bfly(denominator, offset=1 << i)
+
+            numerators = cute.make_rmem_tensor(
+                (cute.ceil_div(self.head_dim, 32),), cutlass.Float32
+            )
+            numerators.fill(0.0)
             for split in cutlass.range_constexpr(self.num_splits):
-                weight = cute.math.exp2(
-                    (partials[batch, beam, head, split, 0] - safe_max) * _LOG2_E
+                split_weight = cute.arch.shuffle_sync(
+                    weight,
+                    split,
+                    mask_and_clamp=((32 - self.combine_group_size) << 8) | 31,
                 )
-                weights[split] = weight
-                denominator += weight * partials[batch, beam, head, split, 1]
+                for i in cutlass.range_constexpr(cute.ceil_div(self.head_dim, 32)):
+                    dim = lane + i * 32
+                    if dim < self.head_dim:
+                        numerators[i] += (
+                            split_weight * partials[batch, beam, head, split, dim + 2]
+                        )
             for i in cutlass.range_constexpr(cute.ceil_div(self.head_dim, 32)):
                 dim = lane + i * 32
                 if dim < self.head_dim:
-                    numerator = cutlass.Float32(0.0)
-                    for split in cutlass.range_constexpr(self.num_splits):
-                        numerator += (
-                            weights[split] * partials[batch, beam, head, split, dim + 2]
-                        )
                     out[batch, beam, head, dim] = cutlass.BFloat16(
-                        numerator / denominator
+                        numerators[i] / denominator
                     )
