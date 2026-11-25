@@ -24,19 +24,45 @@ def gr_paged_decode_attention(
     page_size,
     scale,
 ):
-    batch, width, q_heads, dim = q.shape
-    kv_heads = key_pool.shape[1]
-    # Target 256 CTAs on Hopper; limit splits using the context capacity.
-    num_ctas = batch * q_heads * ((width + 63) // 64)
-    context_capacity = context_pages.shape[1] * page_size
-    num_splits = min(16, max(1, 256 // num_ctas), max(1, context_capacity // 256))
-    # Every paged row/head must start at a 16-byte boundary for vector copies.
-    async_kv = all(
-        t.data_ptr() % 16 == 0
-        and t.stride(-1) == 1
-        and all(s * t.element_size() % 16 == 0 for s in t.stride()[:-1])
-        for t in (key_pool, value_pool)
+    inputs = (
+        q,
+        key_pool,
+        value_pool,
+        context_pages,
+        beam_pages,
+        ancestor_columns,
+        context_lens,
+        history_lens,
     )
+    tensor_specs = tuple((t.dtype, t.shape, t.stride()) for t in inputs)
+    # Base alignment can change even when a pool's shape and strides do not.
+    aligned_kv = ((key_pool.data_ptr() | value_pool.data_ptr()) & 15) == 0
+    cache_key = (q.device, page_size, aligned_kv, tensor_specs)
+    compiled, num_splits = _COMPILED.get(cache_key, (None, 0))
+    batch, width, q_heads, dim = tensor_specs[0][1]
+
+    if compiled is None:
+        kv_heads = key_pool.shape[1]
+        # Target 256 CTAs on Hopper; limit splits using the context capacity.
+        num_ctas = batch * q_heads * ((width + 63) // 64)
+        context_capacity = context_pages.shape[1] * page_size
+        num_splits = min(16, max(1, 256 // num_ctas), max(1, context_capacity // 256))
+        async_kv = aligned_kv and all(
+            t.stride(-1) == 1
+            and all(s * t.element_size() % 16 == 0 for s in t.stride()[:-1])
+            for t in (key_pool, value_pool)
+        )
+        # TensorMap eligibility is fixed by the cached shape/stride signature.
+        tma_kv = (
+            async_kv
+            and page_size == 16
+            and dim in (64, 128)
+            and all(
+                all(0 < n <= 2**31 for n in t.shape)
+                and all(0 < s * t.element_size() < 2**40 for s in t.stride()[:-1])
+                for t in (key_pool, value_pool)
+            )
+        )
 
     out = torch.empty_like(q)
     partials = (
@@ -49,35 +75,17 @@ def gr_paged_decode_attention(
         )
     )
 
-    tensors = (
-        q,
-        key_pool,
-        value_pool,
-        context_pages,
-        beam_pages,
-        ancestor_columns,
-        context_lens,
-        history_lens,
-        partials,
-        out,
-    )
-    cache_key = (
-        q.device,
-        page_size,
-        async_kv,
-        tuple((t.dtype, tuple(t.shape), tuple(t.stride())) for t in tensors),
-    )
-    compiled = _COMPILED.get(cache_key)
-    with torch.cuda.device(q.device):
-        if compiled is None:
+    tensors = (*inputs, partials, out)
+    if compiled is None:
+        with torch.cuda.device(q.device):
             cute_tensors = [
                 from_dlpack(
                     t.detach(),
-                    assumed_align=t.element_size(),
+                    assumed_align=16 if tma_kv and i in (1, 2) else t.element_size(),
                     use_32bit_stride=False,
                     enable_tvm_ffi=True,
                 )
-                for t in tensors
+                for i, t in enumerate(tensors)
             ]
 
             kernel = _GRPagedDecode(
@@ -86,6 +94,7 @@ def gr_paged_decode_attention(
                 page_size,
                 num_splits,
                 async_kv,
+                tma_kv,
             )
 
             compiled = cute.compile(
@@ -95,15 +104,24 @@ def gr_paged_decode_attention(
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            _COMPILED[cache_key] = compiled
+        _COMPILED[cache_key] = compiled, num_splits
 
-        compiled(*tensors, float(scale))
+    # TVM FFI selects the CUDA device and stream from the input tensors.
+    compiled(*tensors, float(scale))
 
-        return out
+    return out
 
 
 class _GRPagedDecode:
-    def __init__(self, head_dim, q_heads_per_kv_head, page_size, num_splits, async_kv):
+    def __init__(
+        self,
+        head_dim,
+        q_heads_per_kv_head,
+        page_size,
+        num_splits,
+        async_kv,
+        tma_kv=False,
+    ):
         self.head_dim = head_dim
         self.q_heads_per_kv_head = q_heads_per_kv_head
         self.page_size = page_size
@@ -111,6 +129,7 @@ class _GRPagedDecode:
         self.combine_group_bits = (num_splits - 1).bit_length()
         self.combine_group_size = 1 << self.combine_group_bits
         self.async_kv = async_kv
+        self.tma_kv = tma_kv
         self.num_stages = 2 if async_kv else 1
         self.tile_m = 64
         self.tile_n = 64
@@ -155,6 +174,29 @@ class _GRPagedDecode:
             order=(0, 1, 2),
         )
 
+        tma_atom_k, tma_key = None, None
+        tma_atom_v, tma_value = None, None
+        if cutlass.const_expr(self.tma_kv):
+            # A SW128 piece spans 64 BF16 values along D. Keep the pool's
+            # original strides; this view only places the head mode last.
+            tma_layout = cute.tile_to_shape(smem_atom, (16, 64), order=(0, 1))
+            tma_atom_k, tma_key = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                cute.make_tensor(
+                    key_pool.iterator, cute.select(key_pool.layout, [0, 2, 1])
+                ),
+                tma_layout,
+                (16, 64),
+            )
+            tma_atom_v, tma_value = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                cute.make_tensor(
+                    value_pool.iterator, cute.select(value_pool.layout, [0, 2, 1])
+                ),
+                tma_layout,
+                (16, 64),
+            )
+
         mma_qk_op = warpgroup.MmaF16BF16Op(
             cutlass.BFloat16,
             cutlass.Float32,
@@ -195,6 +237,10 @@ class _GRPagedDecode:
             partials,
             out,
             scale,
+            tma_atom_k,
+            tma_key,
+            tma_atom_v,
+            tma_value,
             sQ_layout,
             sK_layout,
             sV_layout,
@@ -231,6 +277,10 @@ class _GRPagedDecode:
         partials: cute.Tensor,
         out: cute.Tensor,
         scale: cutlass.Float32,
+        tma_atom_k,
+        tma_key,
+        tma_atom_v,
+        tma_value,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -269,6 +319,17 @@ class _GRPagedDecode:
         batch = batch_split // self.num_splits
         split = batch_split % self.num_splits
         thread_idx, _, _ = cute.arch.thread_idx()
+
+        context_barriers = None
+        if cutlass.const_expr(self.tma_kv):
+            context_barriers = allocator.allocate_array(cutlass.Uint64, self.num_stages)
+            if thread_idx < 32:
+                with cute.arch.elect_one():
+                    for stage in cutlass.range_constexpr(self.num_stages):
+                        cute.arch.mbarrier_init(context_barriers + stage, 1)
+                cpasync.prefetch_descriptor(tma_atom_k)
+                cpasync.prefetch_descriptor(tma_atom_v)
+            cute.arch.mbarrier_init_fence()
 
         beam_begin = beam_tile * self.tile_m
         kv_head = head // self.q_heads_per_kv_head
@@ -343,8 +404,19 @@ class _GRPagedDecode:
                     kv_head,
                     first_tile * self.tile_n,
                     context_len,
+                    tma_atom_k,
+                    tma_key,
+                    tma_atom_v,
+                    tma_value,
+                    context_barriers,
                 )
-                cute.arch.cp_async_wait_group(0)
+                if cutlass.const_expr(self.tma_kv):
+                    if (first_tile + 1) * self.tile_n <= context_len:
+                        cute.arch.mbarrier_wait(context_barriers, 0)
+                    else:
+                        cute.arch.cp_async_wait_group(0)
+                else:
+                    cute.arch.cp_async_wait_group(0)
                 cute.arch.fence_view_async_shared()
                 cute.arch.sync_threads()
 
@@ -364,6 +436,13 @@ class _GRPagedDecode:
                         kv_head,
                         next_tile * self.tile_n,
                         context_len,
+                        tma_atom_k,
+                        tma_key,
+                        tma_atom_v,
+                        tma_value,
+                        context_barriers + (1 - read_stage)
+                        if cutlass.const_expr(self.tma_kv)
+                        else None,
                     )
             else:
                 for i in cutlass.range_constexpr(
@@ -451,7 +530,17 @@ class _GRPagedDecode:
             warpgroup.wait_group(0)
             # Finish the current stage's reads and publish the prefetched stage.
             if cutlass.const_expr(self.async_kv):
-                cute.arch.cp_async_wait_group(0)
+                if cutlass.const_expr(self.tma_kv):
+                    if next_tile < last_tile:
+                        if (next_tile + 1) * self.tile_n <= context_len:
+                            phase = ((next_tile - first_tile) // self.num_stages) % 2
+                            cute.arch.mbarrier_wait(
+                                context_barriers + (1 - read_stage), phase
+                            )
+                        else:
+                            cute.arch.cp_async_wait_group(0)
+                else:
+                    cute.arch.cp_async_wait_group(0)
                 cute.arch.fence_view_async_shared()
             cute.arch.sync_threads()
 
@@ -513,6 +602,95 @@ class _GRPagedDecode:
 
     @cute.jit
     def load_context_tile(
+        self,
+        key_pool: cute.Tensor,
+        value_pool: cute.Tensor,
+        context_pages: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        batch: cutlass.Int32,
+        kv_head: cutlass.Int32,
+        context_begin: cutlass.Int32,
+        context_len: cutlass.Int32,
+        tma_atom_k,
+        tma_key,
+        tma_atom_v,
+        tma_value,
+        context_barrier,
+    ):
+        thread_idx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.tma_kv):
+            if context_begin + self.tile_n <= context_len:
+                if thread_idx < 32:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            context_barrier, self.tile_n * self.head_dim * 2 * 2
+                        )
+                    for page_in_tile in cutlass.range_constexpr(self.tile_n // 16):
+                        physical_page = context_pages[
+                            batch, context_begin // 16 + page_in_tile
+                        ]
+                        for half in cutlass.range_constexpr(self.head_dim // 64):
+                            src_k = cute.local_tile(
+                                tma_key[None, None, kv_head],
+                                (16, 64),
+                                (physical_page, half),
+                            )
+                            src_v = cute.local_tile(
+                                tma_value[None, None, kv_head],
+                                (16, 64),
+                                (physical_page, half),
+                            )
+                            dst_k = cute.local_tile(sK, (16, 64), (page_in_tile, half))
+                            dst_v = cute.local_tile(sV, (16, 64), (page_in_tile, half))
+                            copy_k, coord_k = cpasync.tma_partition(
+                                tma_atom_k,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(dst_k, 0, 2),
+                                cute.group_modes(src_k, 0, 2),
+                            )
+                            copy_v, coord_v = cpasync.tma_partition(
+                                tma_atom_v,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(dst_v, 0, 2),
+                                cute.group_modes(src_v, 0, 2),
+                            )
+                            # The TMA copy atom elects its issuing lane itself.
+                            cute.copy(
+                                tma_atom_k, coord_k, copy_k, tma_bar_ptr=context_barrier
+                            )
+                            cute.copy(
+                                tma_atom_v, coord_v, copy_v, tma_bar_ptr=context_barrier
+                            )
+            else:
+                self.load_context_tile_async(
+                    key_pool,
+                    value_pool,
+                    context_pages,
+                    sK,
+                    sV,
+                    batch,
+                    kv_head,
+                    context_begin,
+                    context_len,
+                )
+        else:
+            self.load_context_tile_async(
+                key_pool,
+                value_pool,
+                context_pages,
+                sK,
+                sV,
+                batch,
+                kv_head,
+                context_begin,
+                context_len,
+            )
+
+    @cute.jit
+    def load_context_tile_async(
         self,
         key_pool: cute.Tensor,
         value_pool: cute.Tensor,
