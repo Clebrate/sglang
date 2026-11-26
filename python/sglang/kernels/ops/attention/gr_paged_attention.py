@@ -4,6 +4,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
+from cutlass.experimental import primitives
 from cutlass.memory import SmemAllocator
 from quack import layout_utils
 
@@ -133,7 +134,7 @@ class _GRPagedDecode:
         self.num_stages = 2 if async_kv else 1
         self.tile_m = 64
         self.tile_n = 64
-        self.num_threads = 128
+        self.num_threads = 256 if tma_kv else 128
 
     @cute.jit
     def __call__(
@@ -253,6 +254,11 @@ class _GRPagedDecode:
                 q.shape[0] * self.num_splits,
             ),
             block=(self.num_threads, 1, 1),
+            min_blocks_per_mp=2 if self.tma_kv else 1,
+            # Hopper rounds these preferences to 164/100 KiB for two CTAs.
+            preferred_smem_carveout=(70 if self.head_dim == 128 else 40)
+            if self.tma_kv
+            else None,
             stream=stream,
         )
 
@@ -319,14 +325,18 @@ class _GRPagedDecode:
         batch = batch_split // self.num_splits
         split = batch_split % self.num_splits
         thread_idx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(thread_idx // 32)
 
         context_barriers = None
+        empty_barriers = None
         if cutlass.const_expr(self.tma_kv):
             context_barriers = allocator.allocate_array(cutlass.Uint64, self.num_stages)
-            if thread_idx < 32:
+            empty_barriers = allocator.allocate_array(cutlass.Uint64, self.num_stages)
+            if warp_idx == 0:
                 with cute.arch.elect_one():
                     for stage in cutlass.range_constexpr(self.num_stages):
                         cute.arch.mbarrier_init(context_barriers + stage, 1)
+                        cute.arch.mbarrier_init(empty_barriers + stage, 4)
                 cpasync.prefetch_descriptor(tma_atom_k)
                 cpasync.prefetch_descriptor(tma_atom_v)
             cute.arch.mbarrier_init_fence()
@@ -336,6 +346,9 @@ class _GRPagedDecode:
 
         context_len = context_lens[batch]
         history_len = history_lens[batch]
+        num_context_tiles = cute.ceil_div(context_len, self.tile_n)
+        first_tile = num_context_tiles * split // self.num_splits
+        last_tile = num_context_tiles * (split + 1) // self.num_splits
 
         for i in cutlass.range_constexpr(
             self.tile_m * self.head_dim // self.num_threads
@@ -355,250 +368,305 @@ class _GRPagedDecode:
         cute.arch.fence_view_async_shared()
         cute.arch.sync_threads()
 
-        # Descriptors are shared by one warpgroup; C fragments are per thread.
-        warpgroup_qk = tiled_mma_qk.get_slice(0)
-        fragment_q = tiled_mma_qk.make_fragment_A(warpgroup_qk.partition_A(sQ))
-        fragment_k = tiled_mma_qk.make_fragment_B(warpgroup_qk.partition_B(sK))
-        warpgroup_pv = tiled_mma_pv.get_slice(0)
-        fragment_p = tiled_mma_pv.make_fragment_A(
-            warpgroup_pv.partition_shape_A((self.tile_m, self.tile_n))
-        )
-        fragment_v = tiled_mma_pv.make_fragment_B(warpgroup_pv.partition_B(sVt))
+        if cutlass.const_expr(self.tma_kv):
+            if warp_idx >= 4:
+                cute.arch.setmaxregister_decrease(32)
+                if warp_idx == 4:
+                    last_full_tile = last_tile
+                    if last_tile * self.tile_n > context_len:
+                        last_full_tile -= 1
+                    for tile in cutlass.range(first_tile, last_full_tile):
+                        write_stage = (tile - first_tile) % self.num_stages
+                        empty_phase = ((tile - first_tile) // self.num_stages) % 2 ^ 1
+                        cute.arch.mbarrier_wait(
+                            empty_barriers + write_stage, empty_phase
+                        )
+                        self.load_context_tile(
+                            key_pool,
+                            value_pool,
+                            context_pages,
+                            sK[None, None, write_stage],
+                            sV[None, None, write_stage],
+                            batch,
+                            kv_head,
+                            tile * self.tile_n,
+                            context_len,
+                            tma_atom_k,
+                            tma_key,
+                            tma_atom_v,
+                            tma_value,
+                            context_barriers + write_stage,
+                        )
+                        # TMA completion supplies the expected transaction bytes.
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(context_barriers + write_stage)
 
-        score_coordinates = tiled_mma_qk.get_slice(thread_idx).partition_C(
-            cute.make_identity_tensor((self.tile_m, self.tile_n))
-        )
-        output_coordinates = tiled_mma_pv.get_slice(thread_idx).partition_C(
-            cute.make_identity_tensor((self.tile_m, self.head_dim))
-        )
-        scores = cute.make_rmem_tensor(score_coordinates.shape, cutlass.Float32)
-        accum = cute.make_rmem_tensor(output_coordinates.shape, cutlass.Float32)
-        accum.fill(0.0)
-        scores_mn = layout_utils.reshape_acc_to_mn(scores)
-        accum_mn = layout_utils.reshape_acc_to_mn(accum)
-        score_coordinates_mn = layout_utils.reshape_acc_to_mn(score_coordinates)
-        output_coordinates_mn = layout_utils.reshape_acc_to_mn(output_coordinates)
-
-        num_rows = cute.size(accum_mn, mode=[0])
-        num_score_columns = cute.size(scores_mn, mode=[1])
-        num_output_columns = cute.size(accum_mn, mode=[1])
-        row_max = cute.make_rmem_tensor((num_rows,), cutlass.Float32)
-        row_sum = cute.make_rmem_tensor((num_rows,), cutlass.Float32)
-        row_max.fill(-cutlass.Float32.inf)
-        row_sum.fill(0.0)
-        tiled_mma_qk.set(warpgroup.Field.ACCUMULATE, True)
-        tiled_mma_pv.set(warpgroup.Field.ACCUMULATE, True)
-
-        num_context_tiles = cute.ceil_div(context_len, self.tile_n)
-        first_tile = num_context_tiles * split // self.num_splits
-        last_tile = num_context_tiles * (split + 1) // self.num_splits
-        if cutlass.const_expr(self.async_kv):
-            if first_tile < last_tile:
-                self.load_context_tile(
-                    key_pool,
-                    value_pool,
-                    context_pages,
-                    sK[None, None, 0],
-                    sV[None, None, 0],
-                    batch,
-                    kv_head,
-                    first_tile * self.tile_n,
-                    context_len,
-                    tma_atom_k,
-                    tma_key,
-                    tma_atom_v,
-                    tma_value,
-                    context_barriers,
-                )
-                if cutlass.const_expr(self.tma_kv):
-                    if (first_tile + 1) * self.tile_n <= context_len:
-                        cute.arch.mbarrier_wait(context_barriers, 0)
-                    else:
-                        cute.arch.cp_async_wait_group(0)
-                else:
+                if first_tile < last_tile and last_tile * self.tile_n > context_len:
+                    tile = last_tile - 1
+                    write_stage = (tile - first_tile) % self.num_stages
+                    empty_phase = ((tile - first_tile) // self.num_stages) % 2 ^ 1
+                    if warp_idx == 4:
+                        cute.arch.mbarrier_wait(
+                            empty_barriers + write_stage, empty_phase
+                        )
+                    # Only the tail needs all 128 producer threads for cp.async.
+                    primitives.barrier_cta_sync(1, thread_count=128)
+                    self.load_context_tile_async(
+                        key_pool,
+                        value_pool,
+                        context_pages,
+                        sK[None, None, write_stage],
+                        sV[None, None, write_stage],
+                        batch,
+                        kv_head,
+                        tile * self.tile_n,
+                        context_len,
+                    )
                     cute.arch.cp_async_wait_group(0)
-                cute.arch.fence_view_async_shared()
-                cute.arch.sync_threads()
+                    cute.arch.fence_view_async_shared()
+                    primitives.barrier_cta_sync(1, thread_count=128)
+                    if warp_idx == 4:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(context_barriers + write_stage)
 
-        for context_tile in cutlass.range(first_tile, last_tile):
-            context_begin = context_tile * self.tile_n
-            read_stage = (context_tile - first_tile) % self.num_stages
-            if cutlass.const_expr(self.async_kv):
-                next_tile = context_tile + 1
-                if next_tile < last_tile:
+        if warp_idx < 4:
+            if cutlass.const_expr(self.tma_kv):
+                cute.arch.setmaxregister_increase(224)
+            # Descriptors are shared by one warpgroup; C fragments are per thread.
+            warpgroup_qk = tiled_mma_qk.get_slice(0)
+            fragment_q = tiled_mma_qk.make_fragment_A(warpgroup_qk.partition_A(sQ))
+            fragment_k = tiled_mma_qk.make_fragment_B(warpgroup_qk.partition_B(sK))
+            warpgroup_pv = tiled_mma_pv.get_slice(0)
+            fragment_p = tiled_mma_pv.make_fragment_A(
+                warpgroup_pv.partition_shape_A((self.tile_m, self.tile_n))
+            )
+            fragment_v = tiled_mma_pv.make_fragment_B(warpgroup_pv.partition_B(sVt))
+
+            score_coordinates = tiled_mma_qk.get_slice(thread_idx).partition_C(
+                cute.make_identity_tensor((self.tile_m, self.tile_n))
+            )
+            output_coordinates = tiled_mma_pv.get_slice(thread_idx).partition_C(
+                cute.make_identity_tensor((self.tile_m, self.head_dim))
+            )
+            scores = cute.make_rmem_tensor(score_coordinates.shape, cutlass.Float32)
+            accum = cute.make_rmem_tensor(output_coordinates.shape, cutlass.Float32)
+            accum.fill(0.0)
+            scores_mn = layout_utils.reshape_acc_to_mn(scores)
+            accum_mn = layout_utils.reshape_acc_to_mn(accum)
+            score_coordinates_mn = layout_utils.reshape_acc_to_mn(score_coordinates)
+            output_coordinates_mn = layout_utils.reshape_acc_to_mn(output_coordinates)
+
+            num_rows = cute.size(accum_mn, mode=[0])
+            num_score_columns = cute.size(scores_mn, mode=[1])
+            num_output_columns = cute.size(accum_mn, mode=[1])
+            row_max = cute.make_rmem_tensor((num_rows,), cutlass.Float32)
+            row_sum = cute.make_rmem_tensor((num_rows,), cutlass.Float32)
+            row_max.fill(-cutlass.Float32.inf)
+            row_sum.fill(0.0)
+            tiled_mma_qk.set(warpgroup.Field.ACCUMULATE, True)
+            tiled_mma_pv.set(warpgroup.Field.ACCUMULATE, True)
+
+            if cutlass.const_expr(self.async_kv and not self.tma_kv):
+                if first_tile < last_tile:
                     self.load_context_tile(
                         key_pool,
                         value_pool,
                         context_pages,
-                        sK[None, None, 1 - read_stage],
-                        sV[None, None, 1 - read_stage],
+                        sK[None, None, 0],
+                        sV[None, None, 0],
                         batch,
                         kv_head,
-                        next_tile * self.tile_n,
+                        first_tile * self.tile_n,
                         context_len,
                         tma_atom_k,
                         tma_key,
                         tma_atom_v,
                         tma_value,
-                        context_barriers + (1 - read_stage)
-                        if cutlass.const_expr(self.tma_kv)
-                        else None,
+                        None,
                     )
-            else:
-                for i in cutlass.range_constexpr(
-                    self.tile_n * self.head_dim // self.num_threads
-                ):
-                    linear = thread_idx + i * self.num_threads
-                    local_token = linear // self.head_dim
-                    dim = linear % self.head_dim
-                    token = context_begin + local_token
-                    key_value = cutlass.BFloat16(0.0)
-                    value_value = cutlass.BFloat16(0.0)
-                    if token < context_len:
-                        page = cutlass.Int64(
-                            context_pages[batch, token // self.page_size]
-                        )
-                        slot = page * cutlass.Int64(self.page_size) + cutlass.Int64(
-                            token % self.page_size
-                        )
-                        key_value = key_pool[slot, kv_head, dim]
-                        value_value = value_pool[slot, kv_head, dim]
-                    sK[local_token, dim, 0] = key_value
-                    sV[local_token, dim, 0] = value_value
-                cute.arch.fence_view_async_shared()
-                cute.arch.sync_threads()
-
-            scores.fill(0.0)
-            warpgroup.fence()
-            for k in cutlass.range_constexpr(cute.size(fragment_q, mode=[2])):
-                cute.gemm(
-                    tiled_mma_qk,
-                    scores,
-                    fragment_q[None, None, k],
-                    fragment_k[None, None, k, read_stage],
-                    scores,
-                )
-            warpgroup.commit_group()
-            warpgroup.wait_group(0)
-
-            for r in cutlass.range_constexpr(num_rows):
-                local_beam = score_coordinates_mn[r, 0][0]
-                beam = beam_begin + local_beam
-                new_max = row_max[r]
-                for c in cutlass.range_constexpr(num_score_columns):
-                    token = context_begin + score_coordinates_mn[r, c][1]
-                    score = -cutlass.Float32.inf
-                    if beam < q.shape[1] and token < context_len:
-                        score = scores_mn[r, c] * scale
-                    scores_mn[r, c] = score
-                    new_max = cute.arch.fmax(new_max, score)
-                for i in cutlass.range_constexpr(2):
-                    new_max = cute.arch.fmax(
-                        new_max,
-                        cute.arch.shuffle_sync_bfly(new_max, offset=1 << i),
-                    )
-                safe_max = new_max
-                if new_max == -cutlass.Float32.inf:
-                    safe_max = cutlass.Float32(0.0)
-                old_weight = cute.math.exp2((row_max[r] - safe_max) * _LOG2_E)
-                tile_sum = cutlass.Float32(0.0)
-                for c in cutlass.range_constexpr(num_score_columns):
-                    weight = cute.math.exp2((scores_mn[r, c] - safe_max) * _LOG2_E)
-                    scores_mn[r, c] = weight
-                    tile_sum += weight
-                # Reduce only this tile; previous row_sum is already replicated.
-                for i in cutlass.range_constexpr(2):
-                    tile_sum += cute.arch.shuffle_sync_bfly(tile_sum, offset=1 << i)
-                row_sum[r] = row_sum[r] * old_weight + tile_sum
-                row_max[r] = new_max
-                for c in cutlass.range_constexpr(num_output_columns):
-                    accum_mn[r, c] = accum_mn[r, c] * old_weight
-
-            # Reinterpret QK's accumulator layout as PV's register A layout.
-            weights = layout_utils.reshape_acc_to_frgA(scores)
-            fragment_p.store(weights.load().to(cutlass.BFloat16))
-            warpgroup.fence()
-            for k in cutlass.range_constexpr(cute.size(fragment_p, mode=[2])):
-                cute.gemm(
-                    tiled_mma_pv,
-                    accum,
-                    fragment_p[None, None, k],
-                    fragment_v[None, None, k, read_stage],
-                    accum,
-                )
-            warpgroup.commit_group()
-            warpgroup.wait_group(0)
-            # Finish the current stage's reads and publish the prefetched stage.
-            if cutlass.const_expr(self.async_kv):
-                if cutlass.const_expr(self.tma_kv):
-                    if next_tile < last_tile:
-                        if (next_tile + 1) * self.tile_n <= context_len:
-                            phase = ((next_tile - first_tile) // self.num_stages) % 2
-                            cute.arch.mbarrier_wait(
-                                context_barriers + (1 - read_stage), phase
-                            )
-                        else:
-                            cute.arch.cp_async_wait_group(0)
-                else:
                     cute.arch.cp_async_wait_group(0)
-                cute.arch.fence_view_async_shared()
-            cute.arch.sync_threads()
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_threads()
 
-        # Distribute private history across splits; four threads share a beam row.
-        quad_lane = thread_idx % 4
-        for history_step in cutlass.range(split, history_len, self.num_splits):
-            for r in cutlass.range_constexpr(num_rows):
-                local_beam = output_coordinates_mn[r, 0][0]
-                beam = beam_begin + local_beam
-                slot = cutlass.Int64(0)
-                score = cutlass.Float32(0.0)
-                if beam < q.shape[1]:
-                    column = cutlass.Int64(ancestor_columns[batch, beam, history_step])
-                    page = cutlass.Int64(
-                        beam_pages[batch, history_step, column // self.page_size]
-                    )
-                    slot = (
-                        page * cutlass.Int64(self.page_size) + column % self.page_size
-                    )
-                    for k in cutlass.range_constexpr(self.head_dim // 4):
-                        dim = quad_lane + k * 4
-                        score += cutlass.Float32(sQ[local_beam, dim]) * cutlass.Float32(
-                            key_pool[slot, kv_head, dim]
+            for context_tile in cutlass.range(first_tile, last_tile):
+                context_begin = context_tile * self.tile_n
+                read_stage = (context_tile - first_tile) % self.num_stages
+                if cutlass.const_expr(self.tma_kv):
+                    phase = ((context_tile - first_tile) // self.num_stages) % 2
+                    cute.arch.mbarrier_wait(context_barriers + read_stage, phase)
+                    cute.arch.fence_view_async_shared()
+                elif cutlass.const_expr(self.async_kv):
+                    next_tile = context_tile + 1
+                    if next_tile < last_tile:
+                        self.load_context_tile(
+                            key_pool,
+                            value_pool,
+                            context_pages,
+                            sK[None, None, 1 - read_stage],
+                            sV[None, None, 1 - read_stage],
+                            batch,
+                            kv_head,
+                            next_tile * self.tile_n,
+                            context_len,
+                            tma_atom_k,
+                            tma_key,
+                            tma_atom_v,
+                            tma_value,
+                            None,
                         )
-                # Keep shuffles outside the tail-beam predicate.
-                for i in cutlass.range_constexpr(2):
-                    score += cute.arch.shuffle_sync_bfly(score, offset=1 << i)
-                score *= scale
-                if beam < q.shape[1]:
-                    new_max = cute.arch.fmax(row_max[r], score)
-                    old_weight = cute.math.exp2((row_max[r] - new_max) * _LOG2_E)
-                    token_weight = cute.math.exp2((score - new_max) * _LOG2_E)
-                    row_sum[r] = row_sum[r] * old_weight + token_weight
+                else:
+                    for i in cutlass.range_constexpr(
+                        self.tile_n * self.head_dim // self.num_threads
+                    ):
+                        linear = thread_idx + i * self.num_threads
+                        local_token = linear // self.head_dim
+                        dim = linear % self.head_dim
+                        token = context_begin + local_token
+                        key_value = cutlass.BFloat16(0.0)
+                        value_value = cutlass.BFloat16(0.0)
+                        if token < context_len:
+                            page = cutlass.Int64(
+                                context_pages[batch, token // self.page_size]
+                            )
+                            slot = page * cutlass.Int64(self.page_size) + cutlass.Int64(
+                                token % self.page_size
+                            )
+                            key_value = key_pool[slot, kv_head, dim]
+                            value_value = value_pool[slot, kv_head, dim]
+                        sK[local_token, dim, 0] = key_value
+                        sV[local_token, dim, 0] = value_value
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_threads()
+
+                scores.fill(0.0)
+                warpgroup.fence()
+                for k in cutlass.range_constexpr(cute.size(fragment_q, mode=[2])):
+                    cute.gemm(
+                        tiled_mma_qk,
+                        scores,
+                        fragment_q[None, None, k],
+                        fragment_k[None, None, k, read_stage],
+                        scores,
+                    )
+                warpgroup.commit_group()
+                warpgroup.wait_group(0)
+
+                for r in cutlass.range_constexpr(num_rows):
+                    local_beam = score_coordinates_mn[r, 0][0]
+                    beam = beam_begin + local_beam
+                    new_max = row_max[r]
+                    for c in cutlass.range_constexpr(num_score_columns):
+                        token = context_begin + score_coordinates_mn[r, c][1]
+                        score = -cutlass.Float32.inf
+                        if beam < q.shape[1] and token < context_len:
+                            score = scores_mn[r, c] * scale
+                        scores_mn[r, c] = score
+                        new_max = cute.arch.fmax(new_max, score)
+                    for i in cutlass.range_constexpr(2):
+                        new_max = cute.arch.fmax(
+                            new_max,
+                            cute.arch.shuffle_sync_bfly(new_max, offset=1 << i),
+                        )
+                    safe_max = new_max
+                    if new_max == -cutlass.Float32.inf:
+                        safe_max = cutlass.Float32(0.0)
+                    old_weight = cute.math.exp2((row_max[r] - safe_max) * _LOG2_E)
+                    tile_sum = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(num_score_columns):
+                        weight = cute.math.exp2((scores_mn[r, c] - safe_max) * _LOG2_E)
+                        scores_mn[r, c] = weight
+                        tile_sum += weight
+                    # Reduce only this tile; previous row_sum is already replicated.
+                    for i in cutlass.range_constexpr(2):
+                        tile_sum += cute.arch.shuffle_sync_bfly(tile_sum, offset=1 << i)
+                    row_sum[r] = row_sum[r] * old_weight + tile_sum
                     row_max[r] = new_max
                     for c in cutlass.range_constexpr(num_output_columns):
-                        dim = output_coordinates_mn[r, c][1]
-                        value = cutlass.Float32(value_pool[slot, kv_head, dim])
-                        accum_mn[r, c] = (
-                            accum_mn[r, c] * old_weight + token_weight * value
-                        )
+                        accum_mn[r, c] = accum_mn[r, c] * old_weight
 
-        for r in cutlass.range_constexpr(num_rows):
-            beam = beam_begin + output_coordinates_mn[r, 0][0]
-            if beam < q.shape[1]:
-                if cutlass.const_expr(self.num_splits == 1):
-                    inv_sum = cutlass.Float32(1.0) / row_sum[r]
-                    for c in cutlass.range_constexpr(num_output_columns):
-                        dim = output_coordinates_mn[r, c][1]
-                        out[batch, beam, head, dim] = cutlass.BFloat16(
-                            accum_mn[r, c] * inv_sum
-                        )
+                # Reinterpret QK's accumulator layout as PV's register A layout.
+                weights = layout_utils.reshape_acc_to_frgA(scores)
+                fragment_p.store(weights.load().to(cutlass.BFloat16))
+                warpgroup.fence()
+                for k in cutlass.range_constexpr(cute.size(fragment_p, mode=[2])):
+                    cute.gemm(
+                        tiled_mma_pv,
+                        accum,
+                        fragment_p[None, None, k],
+                        fragment_v[None, None, k, read_stage],
+                        accum,
+                    )
+                warpgroup.commit_group()
+                warpgroup.wait_group(0)
+                if cutlass.const_expr(self.tma_kv):
+                    # Release this stage only after PV has finished all shared reads.
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(empty_barriers + read_stage)
                 else:
-                    if quad_lane == 0:
-                        partials[batch, beam, head, split, 0] = row_max[r]
-                        partials[batch, beam, head, split, 1] = row_sum[r]
-                    for c in cutlass.range_constexpr(num_output_columns):
-                        dim = output_coordinates_mn[r, c][1]
-                        partials[batch, beam, head, split, dim + 2] = accum_mn[r, c]
+                    if cutlass.const_expr(self.async_kv):
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.fence_view_async_shared()
+                    cute.arch.sync_threads()
+
+            # Distribute private history across splits; four threads share a beam row.
+            quad_lane = thread_idx % 4
+            for history_step in cutlass.range(split, history_len, self.num_splits):
+                for r in cutlass.range_constexpr(num_rows):
+                    local_beam = output_coordinates_mn[r, 0][0]
+                    beam = beam_begin + local_beam
+                    slot = cutlass.Int64(0)
+                    score = cutlass.Float32(0.0)
+                    if beam < q.shape[1]:
+                        column = cutlass.Int64(
+                            ancestor_columns[batch, beam, history_step]
+                        )
+                        page = cutlass.Int64(
+                            beam_pages[batch, history_step, column // self.page_size]
+                        )
+                        slot = (
+                            page * cutlass.Int64(self.page_size)
+                            + column % self.page_size
+                        )
+                        for k in cutlass.range_constexpr(self.head_dim // 4):
+                            dim = quad_lane + k * 4
+                            score += cutlass.Float32(
+                                sQ[local_beam, dim]
+                            ) * cutlass.Float32(key_pool[slot, kv_head, dim])
+                    # Keep shuffles outside the tail-beam predicate.
+                    for i in cutlass.range_constexpr(2):
+                        score += cute.arch.shuffle_sync_bfly(score, offset=1 << i)
+                    score *= scale
+                    if beam < q.shape[1]:
+                        new_max = cute.arch.fmax(row_max[r], score)
+                        old_weight = cute.math.exp2((row_max[r] - new_max) * _LOG2_E)
+                        token_weight = cute.math.exp2((score - new_max) * _LOG2_E)
+                        row_sum[r] = row_sum[r] * old_weight + token_weight
+                        row_max[r] = new_max
+                        for c in cutlass.range_constexpr(num_output_columns):
+                            dim = output_coordinates_mn[r, c][1]
+                            value = cutlass.Float32(value_pool[slot, kv_head, dim])
+                            accum_mn[r, c] = (
+                                accum_mn[r, c] * old_weight + token_weight * value
+                            )
+
+            for r in cutlass.range_constexpr(num_rows):
+                beam = beam_begin + output_coordinates_mn[r, 0][0]
+                if beam < q.shape[1]:
+                    if cutlass.const_expr(self.num_splits == 1):
+                        inv_sum = cutlass.Float32(1.0) / row_sum[r]
+                        for c in cutlass.range_constexpr(num_output_columns):
+                            dim = output_coordinates_mn[r, c][1]
+                            out[batch, beam, head, dim] = cutlass.BFloat16(
+                                accum_mn[r, c] * inv_sum
+                            )
+                    else:
+                        if quad_lane == 0:
+                            partials[batch, beam, head, split, 0] = row_max[r]
+                            partials[batch, beam, head, split, 1] = row_sum[r]
+                        for c in cutlass.range_constexpr(num_output_columns):
+                            dim = output_coordinates_mn[r, c][1]
+                            partials[batch, beam, head, split, dim + 2] = accum_mn[r, c]
 
     @cute.jit
     def load_context_tile(
@@ -619,11 +687,12 @@ class _GRPagedDecode:
         context_barrier,
     ):
         thread_idx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(thread_idx // 32)
         if cutlass.const_expr(self.tma_kv):
             if context_begin + self.tile_n <= context_len:
-                if thread_idx < 32:
+                if warp_idx % 4 == 0:
                     with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
+                        cute.arch.mbarrier_expect_tx(
                             context_barrier, self.tile_n * self.head_dim * 2 * 2
                         )
                     for page_in_tile in cutlass.range_constexpr(self.tile_n // 16):
@@ -714,7 +783,7 @@ class _GRPagedDecode:
             cute.make_layout((16, 8), stride=(8, 1)),
             cute.make_layout((1, 8)),
         )
-        thread_copy = tiled_copy.get_slice(thread_idx)
+        thread_copy = tiled_copy.get_slice(thread_idx % 128)
         copy_coordinates = thread_copy.partition_S(
             cute.make_identity_tensor((self.tile_n, self.head_dim))
         )
