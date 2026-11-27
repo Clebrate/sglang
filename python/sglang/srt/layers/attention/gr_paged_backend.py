@@ -1,20 +1,23 @@
 """Eager GR attention over paged context and a group-owned beam arena.
 
-Hopper BF16 decode uses the CuTe paged operator; Context plus selected ancestry is one softmax
-domain;
+Prefill reuses FA3; Hopper BF16 decode uses the CuTe paged operator.
+Context plus selected ancestry is one softmax domain during decode.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import gcd
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.flash_attention_v3 import flash_attn_with_kvcache
 from sglang.kernels.ops.attention.gr_paged_attention import (
     gr_paged_decode_attention,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 
 if TYPE_CHECKING:
@@ -26,6 +29,10 @@ class _PrefillMetadata:
     context_pages: torch.Tensor
     context_len: int
     prefix_len: int
+    fa3_page_size: int
+    block_table: torch.Tensor
+    cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
 
 
 def _context_locations(pages, length, page_size):
@@ -189,14 +196,34 @@ class GRPagedAttentionBackend(AttentionBackend):
             if len(batch.extend_seq_lens_cpu) != 1:
                 raise ValueError("gr_paged supports one admitted GR group per batch")
             prefix = batch.extend_prefix_lens_cpu[0]
-            context_len = prefix + batch.extend_seq_lens_cpu[0]
-            if context_len < 1 or batch.extend_seq_lens_cpu[0] < 1:
+            query_len = batch.extend_seq_lens_cpu[0]
+            context_len = prefix + query_len
+            if context_len < 1 or query_len < 1:
                 raise ValueError("gr_paged requires a nonempty prefill suffix")
             context_locs = self.req_to_token_pool.req_to_token[
                 batch.req_pool_indices[0], :context_len
             ]
             pages = (context_locs[:: self.page_size] // self.page_size).clone()
-            self.forward_metadata = _PrefillMetadata(pages, context_len, prefix)
+            # Subdivide allocator pages for FA3 without moving KV.
+            fa3_page_size = gcd(self.page_size, 64)
+            ratio = self.page_size // fa3_page_size
+            block_table = pages.unsqueeze(0).to(torch.int32)
+            if ratio > 1:
+                offsets = torch.arange(ratio, dtype=torch.int32, device=pages.device)
+                block_table = (block_table[..., None] * ratio + offsets).flatten(1)
+            self.forward_metadata = _PrefillMetadata(
+                context_pages=pages,
+                context_len=context_len,
+                prefix_len=prefix,
+                fa3_page_size=fa3_page_size,
+                block_table=block_table,
+                cache_seqlens=torch.tensor(
+                    [context_len], dtype=torch.int32, device=pages.device
+                ),
+                cu_seqlens_q=torch.tensor(
+                    [0, query_len], dtype=torch.int32, device=pages.device
+                ),
+            )
         elif not batch.forward_mode.is_idle():
             raise ValueError("gr_paged supports eager prefill and decode only")
 
@@ -222,15 +249,20 @@ class GRPagedAttentionBackend(AttentionBackend):
         return output.reshape(q.shape[0], -1)
 
     def _prefill_attention(self, q, key_pool, value_pool, meta, scale):
-        return torch_prefill_attention(
-            q,
-            key_pool,
-            value_pool,
-            meta.context_pages,
-            meta.context_len,
-            self.page_size,
-            meta.prefix_len,
-            scale,
+        kv_heads, head_dim = key_pool.shape[-2:]
+        page_size = meta.fa3_page_size
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=paged_kv_view(key_pool, page_size, kv_heads, head_dim),
+            v_cache=paged_kv_view(value_pool, page_size, kv_heads, head_dim),
+            page_table=meta.block_table,
+            cache_seqlens=meta.cache_seqlens,
+            cu_seqlens_q=meta.cu_seqlens_q,
+            max_seqlen_q=q.shape[0],
+            softmax_scale=scale,
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=False,
         )
 
     def forward_decode(self, q, k, v, layer, batch, save_kv_cache=True, **kwargs):

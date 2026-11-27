@@ -204,6 +204,12 @@ class TestGRPagedAttention(unittest.TestCase):
         backend.forward_metadata = SimpleNamespace(
             context_pages=meta.context_pages, context_len=3, prefix_len=0
         )
+        # Keep this CPU test focused on the fused writer's KV ownership.
+        backend._prefill_attention = Mock(
+            side_effect=lambda q, k, v, meta, scale: torch_prefill_attention(
+                q, k, v, meta.context_pages, meta.context_len, 16, meta.prefix_len, scale
+            )
+        )
         expected = torch.tensor([2.0, 3.0, 4.0])
         q = torch.zeros(len(expected), 8)
         # Absent or stale input K/V must not replace a fused writer's data.
