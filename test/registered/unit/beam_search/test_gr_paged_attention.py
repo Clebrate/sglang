@@ -1,11 +1,16 @@
 """Paged addressing, offset causality, ancestry isolation and local-head TP."""
 
 import unittest
+from math import gcd
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
 
+from sglang.kernels.ops.attention.flash_attention_v3 import (
+    _is_fa3_supported,
+    flash_attn_with_kvcache,
+)
 from sglang.kernels.ops.attention.gr_paged_attention import gr_paged_decode_attention
 from sglang.srt.beam_search.paged_kv import GRPagedForwardMetadata
 from sglang.srt.layers.attention.gr_paged_backend import (
@@ -34,6 +39,36 @@ def dense_attention(q, k, v, scale, offset=None):
             scores = torch.mv(key, q[row, head].double()) * scale
             result[row, head] = torch.softmax(scores, 0) @ value
     return result
+
+
+def prefill_references(q, k, v, scale, prefix):
+    """Independent logical-KV FP64 reference and a precomputed BF16 error bound.
+
+    Adapt FA2 v2.8.3.post2's forward-test criterion: at most twice the max
+    error of a low-precision reference. Use FP64 instead of its FP32 high reference.
+    This is distinct from the original atol=.002/rtol=.008 pointwise check.
+    """
+    groups = q.shape[1] // k.shape[1]
+    key, value = (x.repeat_interleave(groups, dim=1) for x in (k, v))
+    key_positions = torch.arange(k.shape[0], device=q.device)
+    reference = torch.empty_like(q, dtype=torch.float64)
+    key64 = key.double().permute(1, 2, 0)
+    value64 = value.double().permute(1, 0, 2)
+    for begin in range(0, q.shape[0], 64):
+        end = min(begin + 64, q.shape[0])
+        scores = q[begin:end].double().permute(1, 0, 2) @ key64 * scale
+        positions = prefix + torch.arange(begin, end, device=q.device)
+        scores.masked_fill_(key_positions[None, :] > positions[:, None], -torch.inf)
+        reference[begin:end] = (scores.softmax(-1) @ value64).permute(1, 0, 2)
+
+    # Scale K first and retain BF16 QK, softmax output and PV intermediates,
+    # matching FA2's independent low-precision reference order.
+    scores = torch.einsum("thd,shd->hts", q, key * scale)
+    positions = prefix + torch.arange(q.shape[0], device=q.device)
+    scores.masked_fill_(key_positions[None, :] > positions[:, None], -torch.inf)
+    low = torch.einsum("hts,shd->thd", scores.softmax(-1).to(v.dtype), value)
+    bound = 2 * (low.double() - reference.to(q.dtype).double()).abs().max().item()
+    return reference, bound
 
 
 def layout(context_k, context_v, beam_k, beam_v, page_size, ancestry):
@@ -207,7 +242,14 @@ class TestGRPagedAttention(unittest.TestCase):
         # Keep this CPU test focused on the fused writer's KV ownership.
         backend._prefill_attention = Mock(
             side_effect=lambda q, k, v, meta, scale: torch_prefill_attention(
-                q, k, v, meta.context_pages, meta.context_len, 16, meta.prefix_len, scale
+                q,
+                k,
+                v,
+                meta.context_pages,
+                meta.context_len,
+                16,
+                meta.prefix_len,
+                scale,
             )
         )
         expected = torch.tensor([2.0, 3.0, 4.0])
@@ -250,6 +292,202 @@ class TestGRPagedAttention(unittest.TestCase):
         ).items():
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_gr_paged_configuration({**base, key: value})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "FA3 prefill requires CUDA")
+class TestFA3GRPagedPrefillAttention(unittest.TestCase):
+    def setUp(self):
+        if not _is_fa3_supported():
+            self.skipTest("SGLang FA3 does not support this device")
+        torch.manual_seed(17)
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        self.addCleanup(setattr, torch.backends.cuda.matmul, "allow_tf32", tf32)
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    def _backend(self, q, key, value, metadata, prefix):
+        backend = GRPagedAttentionBackend.__new__(GRPagedAttentionBackend)
+        backend.page_size = metadata.page_size
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=metadata.context_locs[None]
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_kv_buffer=Mock(return_value=(key, value)), set_kv_buffer=Mock()
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[len(q)],
+            extend_prefix_lens_cpu=[prefix],
+            req_pool_indices=torch.tensor([0], device=q.device),
+        )
+        backend.init_forward_metadata(batch)
+        meta = backend.forward_metadata
+        self.assertEqual(meta.fa3_page_size, gcd(metadata.page_size, 64))
+        self.assertEqual(meta.cache_seqlens.tolist(), [metadata.context_len])
+        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, len(q)])
+        torch.testing.assert_close(meta.context_pages, metadata.context_pages)
+        positions = torch.arange(metadata.context_len, device=q.device)
+        slots = (
+            meta.block_table[0, positions // meta.fa3_page_size].long()
+            * meta.fa3_page_size
+            + positions % meta.fa3_page_size
+        )
+        torch.testing.assert_close(slots, metadata.context_locs, atol=0, rtol=0)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=q.shape[1],
+            head_dim=q.shape[2],
+            scaling=q.shape[2] ** -0.5,
+            is_cross_attention=False,
+            logit_cap=0,
+            sliding_window_size=-1,
+        )
+        return backend, layer, batch
+
+    def _check_precision(self, actual, reference, bound):
+        self.assertEqual(actual.shape, reference.shape)
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(actual).all().item())
+        rounded = reference.to(actual.dtype).double()
+        error = (actual.double() - rounded).abs()
+        strict_count = (error > 0.002 + 0.008 * rounded.abs()).sum().item()
+        if strict_count:
+            print(
+                f"FA3 prefill {tuple(actual.shape)}: original pointwise tolerance "
+                f"failed at {strict_count}/{actual.numel()} elements; "
+                f"max error={error.max().item():.8g}, BF16 reference bound={bound:.8g}"
+            )
+        self.assertLessEqual(error.max().item(), bound)
+
+    @torch.inference_mode()
+    def test_pages_prefix_gqa_and_strided_pool(self):
+        for dim in (64, 128):
+            for page_size in (1, 2, 4, 8, 16, 32, 64, 96, 128, 256):
+                for prefix in (0, 17):
+                    with self.subTest(dim=dim, page_size=page_size, prefix=prefix):
+                        length = page_size + 17
+                        q = torch.randn(
+                            length - prefix, 4, dim, device="cuda"
+                        ).bfloat16()
+                        k = torch.randn(length, 2, dim, device="cuda").bfloat16()
+                        v = torch.randn_like(k)
+                        reference, bound = prefill_references(
+                            q, k, v, dim**-0.5, prefix
+                        )
+                        # Reuse the PR's fragmented layout; unused KV stays NaN.
+                        unused = torch.full_like(k[:1, None], torch.nan)
+                        key, value, metadata = layout(
+                            k,
+                            v,
+                            unused,
+                            unused,
+                            page_size,
+                            torch.zeros(1, 1, dtype=torch.int64, device=q.device),
+                        )
+                        if prefix:
+                            pools = []
+                            for pool in (key, value):
+                                backing = pool.new_full(
+                                    (len(pool), 2, 2, dim), torch.nan
+                                )
+                                backing[:, 0].copy_(pool)
+                                pools.append(backing[:, 0])
+                            key, value = pools
+                            self.assertFalse(key.is_contiguous())
+                        backend, layer, batch = self._backend(
+                            q, key, value, metadata, prefix
+                        )
+                        actual = backend.forward_extend(
+                            q.flatten(1), None, None, layer, batch, save_kv_cache=False
+                        ).reshape_as(q)
+                        self._check_precision(actual, reference, bound)
+                        dense = flash_attn_with_kvcache(
+                            q=q,
+                            k_cache=k[None],
+                            v_cache=v[None],
+                            cache_seqlens=backend.forward_metadata.cache_seqlens,
+                            cu_seqlens_q=backend.forward_metadata.cu_seqlens_q,
+                            max_seqlen_q=len(q),
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                            num_splits=0,
+                        )
+                        torch.testing.assert_close(
+                            actual, dense, atol=0.002, rtol=0.008
+                        )
+                        backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
+
+    @torch.inference_mode()
+    def test_offset_causality_and_previously_written_kv(self):
+        for dim in (64, 128):
+            for page_size in (16, 128, 256):
+                with self.subTest(dim=dim, page_size=page_size):
+                    k = torch.zeros(5, 1, dim, device="cuda", dtype=torch.bfloat16)
+                    v = torch.tensor([1, 2, 3, 4, 1000], device=k.device, dtype=k.dtype)
+                    v = v[:, None, None].expand_as(k)
+                    unused = torch.full_like(k[:1, None], torch.nan)
+                    key, value, metadata = layout(
+                        k,
+                        v,
+                        unused,
+                        unused,
+                        page_size,
+                        torch.zeros(1, 1, dtype=torch.int64, device=k.device),
+                    )
+                    q = k.new_zeros(2, 8 * dim)[:, : 4 * dim]
+                    backend, layer, batch = self._backend(
+                        q.reshape(2, 4, dim), key, value, metadata, 3
+                    )
+                    expected = q.new_tensor([2.5, 202])[:, None].expand_as(q)
+                    for kv in (None, torch.full_like(k[3:], torch.nan)):
+                        with self.subTest(missing_kv=kv is None):
+                            actual = backend.forward_extend(
+                                q, kv, kv, layer, batch, save_kv_cache=False
+                            )
+                            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
+
+    @torch.inference_mode()
+    def test_recsys_default_shape_precision(self):
+        # Preserve the full shape/RNG of the two observed near-zero deviations.
+        # Improved kernels may eliminate them: do not require a failure count
+        # or hard-code historical FA3 outputs.
+        torch.manual_seed(42)
+        q = torch.randn(4700, 16, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(4700, 8, 128, device=q.device, dtype=q.dtype)
+        v = torch.randn_like(k)
+        reference, bound = prefill_references(q, k, v, 128**-0.5, 0)
+        unused = torch.full_like(k[:1, None], torch.nan)
+        key, value, metadata = layout(
+            k,
+            v,
+            unused,
+            unused,
+            16,
+            torch.zeros(1, 1, dtype=torch.int64, device=q.device),
+        )
+        backend, layer, batch = self._backend(q, key, value, metadata, 0)
+        actual = backend.forward_extend(
+            q.flatten(1), None, None, layer, batch, save_kv_cache=False
+        ).reshape_as(q)
+        self._check_precision(actual, reference, bound)
+        dense = flash_attn_with_kvcache(
+            q=q,
+            k_cache=k[None],
+            v_cache=v[None],
+            cache_seqlens=backend.forward_metadata.cache_seqlens,
+            cu_seqlens_q=backend.forward_metadata.cu_seqlens_q,
+            max_seqlen_q=len(q),
+            softmax_scale=layer.scaling,
+            causal=True,
+            num_splits=0,
+        )
+        torch.testing.assert_close(actual, dense, atol=0.002, rtol=0.008)
+        original = torch_prefill_attention(
+            q, key, value, metadata.context_pages, 4700, 16, 0, layer.scaling
+        )
+        torch.testing.assert_close(
+            original, reference.to(q.dtype), atol=0.002, rtol=0.008
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CuTe decode requires CUDA")
