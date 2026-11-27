@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.flash_attention_v3 import flash_attn_with_kvcache
-from sglang.kernels.ops.attention.gr_paged_attention import (
+from sglang.kernels.ops.attention.gr_paged_decode_attention import (
     gr_paged_decode_attention,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend

@@ -11,7 +11,9 @@ from sglang.kernels.ops.attention.flash_attention_v3 import (
     _is_fa3_supported,
     flash_attn_with_kvcache,
 )
-from sglang.kernels.ops.attention.gr_paged_attention import gr_paged_decode_attention
+from sglang.kernels.ops.attention.gr_paged_decode_attention import (
+    gr_paged_decode_attention,
+)
 from sglang.srt.beam_search.paged_kv import GRPagedForwardMetadata
 from sglang.srt.layers.attention.gr_paged_backend import (
     GRPagedAttentionBackend,
